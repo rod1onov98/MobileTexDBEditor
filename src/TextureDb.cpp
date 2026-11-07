@@ -982,18 +982,66 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
     }
     tf.close();
 
-    const std::string prefix = lowerAscii(m_baseName) + ".";
-    for (const auto& de : std::filesystem::directory_iterator(m_sourceDir)) {
-        if (!de.is_regular_file()) {
-            continue;
-        }
-        const auto fn = de.path().filename().string();
-        const auto lfn = lowerAscii(fn);
-        if (startsWith(lfn, prefix) && endsWith(lfn, ".tmb")) {
-            std::error_code ec;
-            std::filesystem::copy_file(de.path(), out / de.path().filename(), std::filesystem::copy_options::overwrite_existing, ec);
+    std::vector<const TextureEntry*> newTextureEntries;
+    for (const TextureEntry* e : finalEntries) {
+        if (e->originalIndex < 0) {
+            if (!e->replacement || !e->replacement->valid()) {
+                throw std::runtime_error("New texture missing valid image while writing TMB");
+            }
+            newTextureEntries.push_back(e);
         }
     }
+
+    for (const auto& p : m_platforms) {
+        if (!std::filesystem::exists(p.tmbPath)) {
+            if (!newTextureEntries.empty()) {
+                throw std::runtime_error("Missing thumbnail file for " + p.tag +
+                    ": " + p.tmbPath.string() + ". Cannot safely add textures without TMB.");
+            }
+            continue;
+        }
+        const auto outTmb = out / p.tmbPath.filename();
+        std::filesystem::copy_file(p.tmbPath, outTmb,
+                                   std::filesystem::copy_options::overwrite_existing);
+        if (newTextureEntries.empty()) {
+            continue;
+        }
+        std::ofstream thumb(outTmb, std::ios::binary | std::ios::app);
+        if (!thumb) {
+            throw std::runtime_error("Cannot append thumbnail records: " + outTmb.string());
+        }
+        for (const TextureEntry* e : newTextureEntries) {
+            const auto& img = *e->replacement;
+            const auto pixels = static_cast<std::uint64_t>(img.width) * img.height * 4;
+            if (pixels > std::numeric_limits<std::uint32_t>::max() - 4) {
+                throw std::runtime_error("Thumbnail too large: " + e->name);
+            }
+            wr16(thumb, hash16(e->name));
+            wr16(thumb, ENC_RGBA8888);
+            wr16(thumb, static_cast<std::uint16_t>(img.width));
+            wr16(thumb, static_cast<std::uint16_t>(img.height));
+            wr32(thumb, static_cast<std::uint32_t>(pixels) + 4);
+            wr32(thumb, 0);
+            thumb.write(reinterpret_cast<const char*>(img.pixels.data()),
+                        static_cast<std::streamsize>(img.pixels.size()));
+            if (!thumb) {
+                throw std::runtime_error("Failed appending thumbnail: " + e->name);
+            }
+        }
+    }
+
+    // Preserve other thumbnail formats not represented by a DAT/TOC pair.
+    const std::string prefix = lowerAscii(m_baseName) + ".";
+    for (const auto& de : std::filesystem::directory_iterator(m_sourceDir)) {
+        if (!de.is_regular_file()) continue;
+        const auto fn = de.path().filename().string();
+        const auto lfn = lowerAscii(fn);
+        if (!startsWith(lfn, prefix) || !endsWith(lfn, ".tmb")) continue;
+        const auto dst = out / de.path().filename();
+        if (std::filesystem::exists(dst)) continue;
+        std::filesystem::copy_file(de.path(), dst, std::filesystem::copy_options::overwrite_existing);
+    }
+
 }
 
 std::string TextureDatabase::validationSummary() const {
