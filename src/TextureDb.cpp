@@ -180,21 +180,34 @@ std::string setProperty(std::string line, const std::string& key, const std::str
     return line;
 }
 
-uint16_t rd16(const uint8_t* p) {
+uint16_t rd16(const uint8_t* p, Endian e) {
+    if (e == Endian::Big) {
+        return static_cast<uint16_t>((static_cast<uint16_t>(p[0]) << 8) | p[1]);
+    }
     return static_cast<uint16_t>(p[0] | (static_cast<uint16_t>(p[1]) << 8));
 }
-uint32_t rd32(const uint8_t* p) {
+uint32_t rd32(const uint8_t* p, Endian e) {
+    if (e == Endian::Big) {
+        return (static_cast<uint32_t>(p[0]) << 24) | (static_cast<uint32_t>(p[1]) << 16) | (static_cast<uint32_t>(p[2]) << 8) | static_cast<uint32_t>(p[3]);
+    }
     return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) | (static_cast<uint32_t>(p[2]) << 16) | (static_cast<uint32_t>(p[3]) << 24);
 }
 
-void wr16(std::ostream& o, uint16_t v) {
-    const std::array<uint8_t, 2> b{static_cast<uint8_t>(v), static_cast<uint8_t>(v >> 8)};
+void wr16(std::ostream& o, uint16_t v, Endian e) {
+    const std::array<uint8_t, 2> b = e == Endian::Big
+        ? std::array<uint8_t, 2>{static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v)}
+        : std::array<uint8_t, 2>{static_cast<uint8_t>(v), static_cast<uint8_t>(v >> 8)};
     o.write(reinterpret_cast<const char*>(b.data()), b.size());
 }
-void wr32(std::ostream& o, uint32_t v) {
-    const std::array<uint8_t, 4> b { static_cast<uint8_t>(v), static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 24) };
+void wr32(std::ostream& o, uint32_t v, Endian e) {
+    const std::array<uint8_t, 4> b = e == Endian::Big
+        ? std::array<uint8_t, 4>{static_cast<uint8_t>(v >> 24), static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v)}
+        : std::array<uint8_t, 4>{static_cast<uint8_t>(v), static_cast<uint8_t>(v >> 8), static_cast<uint8_t>(v >> 16), static_cast<uint8_t>(v >> 24)};
     o.write(reinterpret_cast<const char*>(b.data()), b.size());
 }
+
+// PS3 databases are big-endian; every other platform tag seen so far is little-endian.
+Endian endianForTag(const std::string& tag);
 
 std::string lowerAscii(std::string s) {
     for (char& c : s) {
@@ -203,6 +216,53 @@ std::string lowerAscii(std::string s) {
         }
     }
     return s;
+}
+
+Endian endianForTag(const std::string& tag) {
+    return lowerAscii(tag) == "ps3" ? Endian::Big : Endian::Little;
+}
+
+// Rebuilds the offset table by walking the DAT. Records are stored back to back in TXT
+// order; affiliate entries have no record. Every record's hash must match its TXT name.
+std::vector<std::int32_t> scanDatOffsets(const std::filesystem::path& datPath, uint32_t datSize,
+                                         const std::vector<TextureEntry>& entries, Endian endian,
+                                         const std::string& tag) {
+    std::ifstream f(datPath, std::ios::binary);
+    if (!f) {
+        throw std::runtime_error("Cannot open DAT: " + datPath.string());
+    }
+    std::vector<std::int32_t> offsets;
+    offsets.reserve(entries.size());
+    uint64_t pos = 0;
+    for (const auto& e : entries) {
+        if (getProperty(e.line, "affiliate").has_value()) {
+            offsets.push_back(-1);
+            continue;
+        }
+        if (pos + 16 > datSize) {
+            throw std::runtime_error("DAT ends before record for '" + e.name + "' (" + tag + ")");
+        }
+        f.seekg(static_cast<std::streamoff>(pos), std::ios::beg);
+        std::array<uint8_t, 16> b{};
+        f.read(reinterpret_cast<char*>(b.data()), b.size());
+        if (f.gcount() != static_cast<std::streamsize>(b.size())) {
+            throw std::runtime_error("Truncated DAT header while scanning '" + e.name + "'");
+        }
+        const uint16_t hash = rd16(b.data(), endian);
+        if (hash != TextureDatabase::hash16(e.name)) {
+            std::ostringstream ss;
+            ss << "DAT record hash mismatch for '" << e.name << "' at offset " << pos << " (" << tag << ")";
+            throw std::runtime_error(ss.str());
+        }
+        const uint32_t stored = rd32(b.data() + 8, endian);
+        offsets.push_back(static_cast<std::int32_t>(pos));
+        // Header is 12 bytes before the stored block, which includes the 4-byte RLE word.
+        pos += 12ull + stored;
+        if (pos > datSize) {
+            throw std::runtime_error("DAT record for '" + e.name + "' runs past end of file (" + tag + ")");
+        }
+    }
+    return offsets;
 }
 
 std::size_t encodedMipSize(uint16_t encoding, uint32_t w, uint32_t h) {
@@ -224,15 +284,6 @@ std::size_t encodedMipSize(uint16_t encoding, uint32_t w, uint32_t h) {
 std::size_t totalEncodedSize(uint16_t encoding, uint32_t w, uint32_t h, bool hasMipChain) {
     std::size_t total = encodedMipSize(encoding, w, h);
     if (!hasMipChain || total == 0) {
-        return total;
-    }
-
-    if (encoding == ENC_DXT1 || encoding == ENC_DXT5) {
-        while (w > 4 && h > 4) {
-            w = std::max<uint32_t>(1, w / 2);
-            h = std::max<uint32_t>(1, h / 2);
-            total += encodedMipSize(encoding, w, h);
-        }
         return total;
     }
 
@@ -260,11 +311,13 @@ std::size_t rlePixelBlockSize(uint16_t encoding) {
     }
 }
 
-std::vector<uint8_t> rleDecompress(const std::vector<uint8_t>& stored, std::size_t expected, std::size_t pixelBlockSize) {
+std::vector<uint8_t> rleDecompress(const std::vector<uint8_t>& stored, std::size_t expected, std::size_t pixelBlockSize, Endian e) {
     if (stored.size() < 4) {
         throw std::runtime_error("Broken RLE payload");
     }
-    const uint8_t control = stored[0];
+    // The first 4 bytes are the RLE word; the control byte is its least significant byte,
+    // which is the first byte for little-endian and the last byte for big-endian.
+    const uint8_t control = e == Endian::Big ? stored[3] : stored[0];
     const std::size_t block = std::max<std::size_t>(4, pixelBlockSize);
     std::vector<uint8_t> out;
     out.reserve(expected);
@@ -318,7 +371,7 @@ void putPixel(ImageRGBA& img, uint32_t x, uint32_t y, const Color& c) {
     img.pixels[p + 3] = c.a;
 }
 
-ImageRGBA decodeDxt1(const std::vector<uint8_t>& data, uint32_t w, uint32_t h) {
+ImageRGBA decodeDxt1(const std::vector<uint8_t>& data, uint32_t w, uint32_t h, Endian e) {
     const std::size_t need = encodedMipSize(ENC_DXT1, w, h);
     if (data.size() < need) {
         throw std::runtime_error("DXT1 payload is truncated");
@@ -327,9 +380,9 @@ ImageRGBA decodeDxt1(const std::vector<uint8_t>& data, uint32_t w, uint32_t h) {
     std::size_t p = 0;
     for (uint32_t by = 0; by < (h + 3) / 4; ++by) {
         for (uint32_t bx = 0; bx < (w + 3) / 4; ++bx) {
-            const uint16_t c0 = rd16(&data[p]);
-            const uint16_t c1 = rd16(&data[p + 2]);
-            const uint32_t bits = rd32(&data[p + 4]);
+            const uint16_t c0 = rd16(&data[p], e);
+            const uint16_t c1 = rd16(&data[p + 2], e);
+            const uint32_t bits = rd32(&data[p + 4], e);
             p += 8;
             std::array<Color, 4> pal{};
             pal[0] = rgb565(c0);
@@ -352,7 +405,7 @@ ImageRGBA decodeDxt1(const std::vector<uint8_t>& data, uint32_t w, uint32_t h) {
     return out;
 }
 
-ImageRGBA decodeDxt5(const std::vector<uint8_t>& data, uint32_t w, uint32_t h) {
+ImageRGBA decodeDxt5(const std::vector<uint8_t>& data, uint32_t w, uint32_t h, Endian e) {
     const std::size_t need = encodedMipSize(ENC_DXT5, w, h);
     if (data.size() < need) {
         throw std::runtime_error("DXT5 payload is truncated");
@@ -378,9 +431,9 @@ ImageRGBA decodeDxt5(const std::vector<uint8_t>& data, uint32_t w, uint32_t h) {
                 alpha[6] = 0; alpha[7] = 255;
             }
 
-            const uint16_t c0 = rd16(&data[p + 8]);
-            const uint16_t c1 = rd16(&data[p + 10]);
-            const uint32_t cbits = rd32(&data[p + 12]);
+            const uint16_t c0 = rd16(&data[p + 8], e);
+            const uint16_t c1 = rd16(&data[p + 10], e);
+            const uint32_t cbits = rd32(&data[p + 12], e);
             p += 16;
             std::array<Color, 4> pal{};
             pal[0] = rgb565(c0); pal[1] = rgb565(c1);
@@ -401,14 +454,14 @@ ImageRGBA decodeDxt5(const std::vector<uint8_t>& data, uint32_t w, uint32_t h) {
     return out;
 }
 
-ImageRGBA decode565(const std::vector<uint8_t>& data, uint32_t w, uint32_t h) {
+ImageRGBA decode565(const std::vector<uint8_t>& data, uint32_t w, uint32_t h, Endian e) {
     const std::size_t need = static_cast<std::size_t>(w) * h * 2;
     if (data.size() < need) {
         throw std::runtime_error("RGB565 payload is truncated");
     }
     ImageRGBA out{w, h, std::vector<uint8_t>(static_cast<std::size_t>(w) * h * 4)};
     for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i) {
-        const auto c = rgb565(rd16(&data[i * 2]));
+        const auto c = rgb565(rd16(&data[i * 2], e));
         out.pixels[i * 4 + 0] = c.r;
         out.pixels[i * 4 + 1] = c.g;
         out.pixels[i * 4 + 2] = c.b;
@@ -417,14 +470,14 @@ ImageRGBA decode565(const std::vector<uint8_t>& data, uint32_t w, uint32_t h) {
     return out;
 }
 
-ImageRGBA decode4444(const std::vector<uint8_t>& data, uint32_t w, uint32_t h) {
+ImageRGBA decode4444(const std::vector<uint8_t>& data, uint32_t w, uint32_t h, Endian e) {
     const std::size_t need = static_cast<std::size_t>(w) * h * 2;
     if (data.size() < need) {
         throw std::runtime_error("RGBA4444 payload is truncated");
     }
     ImageRGBA out{w, h, std::vector<uint8_t>(static_cast<std::size_t>(w) * h * 4)};
     for (std::size_t i = 0; i < static_cast<std::size_t>(w) * h; ++i) {
-        const uint16_t v = rd16(&data[i * 2]);
+        const uint16_t v = rd16(&data[i * 2], e);
         const uint8_t r = static_cast<uint8_t>((v >> 12) & 0xF);
         const uint8_t g = static_cast<uint8_t>((v >> 8) & 0xF);
         const uint8_t b = static_cast<uint8_t>((v >> 4) & 0xF);
@@ -433,6 +486,122 @@ ImageRGBA decode4444(const std::vector<uint8_t>& data, uint32_t w, uint32_t h) {
         out.pixels[i * 4 + 1] = static_cast<uint8_t>(g * 17);
         out.pixels[i * 4 + 2] = static_cast<uint8_t>(b * 17);
         out.pixels[i * 4 + 3] = static_cast<uint8_t>(a * 17);
+    }
+    return out;
+}
+
+// ---- DXT encoding: the inverse of decodeDxt1 / decodeDxt5 ----
+// Colour and alpha endpoints are written little-endian, which matches the PS3 texel
+// data. Every colour block uses 4-colour mode (c0 > c1), which the decoders expect.
+
+uint16_t packRgb565(int r, int g, int b) {
+    const int r5 = std::clamp((r * 31 + 127) / 255, 0, 31);
+    const int g6 = std::clamp((g * 63 + 127) / 255, 0, 63);
+    const int b5 = std::clamp((b * 31 + 127) / 255, 0, 31);
+    return static_cast<uint16_t>((r5 << 11) | (g6 << 5) | b5);
+}
+
+// Chooses endpoints for a block of 16 colours and returns the 2-bit indices, in the
+// same order the decoders read them (pixel n uses bits 2n..2n+1).
+void encodeColourBlock(const std::array<Color, 16>& px, uint16_t& c0, uint16_t& c1, uint32_t& bits) {
+    int lo = 0, hi = 0;
+    for (int i = 1; i < 16; ++i) {
+        const int li = 2 * px[i].r + 5 * px[i].g + px[i].b;
+        if (li > 2 * px[hi].r + 5 * px[hi].g + px[hi].b) hi = i;
+        if (li < 2 * px[lo].r + 5 * px[lo].g + px[lo].b) lo = i;
+    }
+    c0 = packRgb565(px[hi].r, px[hi].g, px[hi].b);
+    c1 = packRgb565(px[lo].r, px[lo].g, px[lo].b);
+    if (c0 == c1) {
+        if (c0 > 0) c1 = static_cast<uint16_t>(c0 - 1);
+        else c0 = static_cast<uint16_t>(c1 + 1);
+    }
+    if (c0 < c1) std::swap(c0, c1);
+
+    // Same palette the decoder builds from the endpoints.
+    const Color p0 = rgb565(c0), p1 = rgb565(c1);
+    const std::array<Color, 4> pal{
+        p0, p1,
+        Color{static_cast<uint8_t>((2 * p0.r + p1.r) / 3), static_cast<uint8_t>((2 * p0.g + p1.g) / 3), static_cast<uint8_t>((2 * p0.b + p1.b) / 3), 255},
+        Color{static_cast<uint8_t>((p0.r + 2 * p1.r) / 3), static_cast<uint8_t>((p0.g + 2 * p1.g) / 3), static_cast<uint8_t>((p0.b + 2 * p1.b) / 3), 255},
+    };
+    bits = 0;
+    for (int n = 0; n < 16; ++n) {
+        int best = 0;
+        long bestErr = -1;
+        for (int k = 0; k < 4; ++k) {
+            const long dr = px[n].r - pal[k].r, dg = px[n].g - pal[k].g, db = px[n].b - pal[k].b;
+            const long err = dr * dr + dg * dg + db * db;
+            if (bestErr < 0 || err < bestErr) { bestErr = err; best = k; }
+        }
+        bits |= static_cast<uint32_t>(best) << (2 * n);
+    }
+}
+
+// Alpha block for DXT5: 2 endpoints + 16 3-bit indices (48 bits, little-endian).
+void encodeAlphaBlock(const std::array<Color, 16>& px, uint8_t& a0, uint8_t& a1, uint64_t& bits) {
+    int lo = 0, hi = 0;
+    for (int i = 1; i < 16; ++i) {
+        if (px[i].a > px[hi].a) hi = i;
+        if (px[i].a < px[lo].a) lo = i;
+    }
+    int A0 = px[hi].a, A1 = px[lo].a;
+    if (A0 == A1) {
+        if (A0 < 255) A0 += 1;
+        else A1 -= 1;
+    }
+    if (A0 < A1) std::swap(A0, A1);
+    a0 = static_cast<uint8_t>(A0);
+    a1 = static_cast<uint8_t>(A1);
+
+    std::array<int, 8> pal{};
+    pal[0] = a0; pal[1] = a1;
+    for (int i = 1; i <= 6; ++i) pal[i + 1] = ((7 - i) * a0 + i * a1) / 7;
+
+    bits = 0;
+    for (int n = 0; n < 16; ++n) {
+        int best = 0, bestErr = -1;
+        for (int k = 0; k < 8; ++k) {
+            const int err = std::abs(static_cast<int>(px[n].a) - pal[k]);
+            if (bestErr < 0 || err < bestErr) { bestErr = err; best = k; }
+        }
+        bits |= static_cast<uint64_t>(best) << (3 * n);
+    }
+}
+
+// Encodes one image level. Partial blocks at the right and bottom edges repeat the last row/column.
+std::vector<uint8_t> encodeDxtLevel(const ImageRGBA& img, bool dxt5) {
+    const uint32_t bw = (img.width + 3) / 4, bh = (img.height + 3) / 4;
+    std::vector<uint8_t> out;
+    out.reserve(static_cast<std::size_t>(bw) * bh * (dxt5 ? 16 : 8));
+    for (uint32_t by = 0; by < bh; ++by) {
+        for (uint32_t bx = 0; bx < bw; ++bx) {
+            std::array<Color, 16> px{};
+            for (uint32_t py = 0; py < 4; ++py) {
+                for (uint32_t pxi = 0; pxi < 4; ++pxi) {
+                    const uint32_t x = std::min(bx * 4 + pxi, img.width - 1);
+                    const uint32_t y = std::min(by * 4 + py, img.height - 1);
+                    const std::size_t i = (static_cast<std::size_t>(y) * img.width + x) * 4;
+                    px[py * 4 + pxi] = Color{img.pixels[i], img.pixels[i + 1], img.pixels[i + 2], img.pixels[i + 3]};
+                }
+            }
+            if (dxt5) {
+                uint8_t a0 = 0, a1 = 0;
+                uint64_t abits = 0;
+                encodeAlphaBlock(px, a0, a1, abits);
+                out.push_back(a0);
+                out.push_back(a1);
+                for (int i = 0; i < 6; ++i) out.push_back(static_cast<uint8_t>(abits >> (8 * i)));
+            }
+            uint16_t c0 = 0, c1 = 0;
+            uint32_t cbits = 0;
+            encodeColourBlock(px, c0, c1, cbits);
+            out.push_back(static_cast<uint8_t>(c0));
+            out.push_back(static_cast<uint8_t>(c0 >> 8));
+            out.push_back(static_cast<uint8_t>(c1));
+            out.push_back(static_cast<uint8_t>(c1 >> 8));
+            for (int i = 0; i < 4; ++i) out.push_back(static_cast<uint8_t>(cbits >> (8 * i)));
+        }
     }
     return out;
 }
@@ -563,7 +732,8 @@ TextureDatabase TextureDatabase::Open(const std::filesystem::path& txtFile) {
         auto tb = readAll(toc);
         if (tb.size() < 4 || (tb.size() - 4) % 4 != 0)
             throw std::runtime_error("Malformed TOC: " + toc.string());
-        p.datSize = rd32(tb.data());
+        p.endian = endianForTag(tag);
+        p.datSize = rd32(tb.data(), p.endian);
         const std::size_t count = (tb.size() - 4) / 4;
         if (count != db.m_entries.size()) {
             std::ostringstream ss;
@@ -572,15 +742,15 @@ TextureDatabase TextureDatabase::Open(const std::filesystem::path& txtFile) {
         }
         p.offsets.resize(count);
         for (std::size_t i = 0; i < count; ++i)
-            p.offsets[i] = static_cast<std::int32_t>(rd32(tb.data() + 4 + i * 4));
+            p.offsets[i] = static_cast<std::int32_t>(rd32(tb.data() + 4 + i * 4, p.endian));
 
         const auto realSize = std::filesystem::file_size(p.datPath);
         if (realSize > std::numeric_limits<uint32_t>::max())
             throw std::runtime_error("DAT is larger than 4 GiB and is not supported by this editor");
         if (p.datSize != realSize) {
-            std::ostringstream ss;
-            ss << "TOC/DAT size mismatch for " << tag << ": TOC=" << p.datSize << ", DAT=" << realSize;
-            throw std::runtime_error(ss.str());
+            // The game ignores a TOC whose size does not match the DAT and reads the
+            // offsets from the DAT itself. Do the same instead of refusing the database.
+            p.offsets = scanDatOffsets(p.datPath, static_cast<uint32_t>(realSize), db.m_entries, p.endian, tag);
         }
         db.m_platforms.push_back(std::move(p));
     }
@@ -723,7 +893,8 @@ TextureDatabase::RecordHeader TextureDatabase::readHeader(const PlatformInfo& p,
     if (f.gcount() != static_cast<std::streamsize>(b.size())) {
         throw std::runtime_error("Truncated DAT header");
     }
-    return RecordHeader{ rd16(b.data()), rd16(b.data() + 2), rd16(b.data() + 4), rd16(b.data() + 6), rd32(b.data() + 8), rd32(b.data() + 12) };
+    const Endian e = p.endian;
+    return RecordHeader{ rd16(b.data(), e), rd16(b.data() + 2, e), rd16(b.data() + 4, e), rd16(b.data() + 6, e), rd32(b.data() + 8, e), rd32(b.data() + 12, e) };
 }
 
 std::uint64_t TextureDatabase::recordSpan(const PlatformInfo& p, int originalIndex) {
@@ -746,12 +917,13 @@ ImageRGBA TextureDatabase::decodeRecord(const PlatformInfo& p, int originalIndex
     const RecordHeader h = readHeader(p, originalIndex);
     const std::int32_t off = p.offsets.at(static_cast<std::size_t>(originalIndex));
     const uint32_t w = h.width;
-    const uint32_t hh = h.heightMask & 0x7FFF;
+    // Height field stores 2 * height; the low bit set means a mip chain follows.
+    const uint32_t hh = (h.heightMask & 0x7FFF) >> 1;
     if (!w || !hh) {
         throw std::runtime_error("Texture has zero dimensions");
     }
 
-    const bool hasMipChain = (h.heightMask & 0x8000) != 0;
+    const bool hasMipChain = (h.heightMask & 0x0001) != 0;
     const std::size_t expected = totalEncodedSize(h.encoding, w, hh, hasMipChain);
     if (expected == 0) {
         throw std::runtime_error("Preview decoder does not support encoding " + encodingName(h.encoding));
@@ -774,7 +946,7 @@ ImageRGBA TextureDatabase::decodeRecord(const PlatformInfo& p, int originalIndex
     if (h.rle == 0) {
         encoded.assign(stored.begin() + 4, stored.end());
     } else {
-        encoded = rleDecompress(stored, expected, rlePixelBlockSize(h.encoding));
+        encoded = rleDecompress(stored, expected, rlePixelBlockSize(h.encoding), p.endian);
     }
 
     const std::size_t firstMip = encodedMipSize(h.encoding, w, hh);
@@ -787,13 +959,14 @@ ImageRGBA TextureDatabase::decodeRecord(const PlatformInfo& p, int originalIndex
     case ENC_RGBA8888:
         return ImageRGBA{w, hh, std::move(encoded)};
     case ENC_RGB565:
-        return decode565(encoded, w, hh);
+        return decode565(encoded, w, hh, p.endian);
     case ENC_RGBA4444:
-        return decode4444(encoded, w, hh);
+        return decode4444(encoded, w, hh, p.endian);
     case ENC_DXT1:
-        return decodeDxt1(encoded, w, hh);
+        // DXT endpoints are little-endian in the PS3 data (checked on menu.ps3).
+        return decodeDxt1(encoded, w, hh, Endian::Little);
     case ENC_DXT5:
-        return decodeDxt5(encoded, w, hh);
+        return decodeDxt5(encoded, w, hh, Endian::Little);
     default:
         throw std::runtime_error("Preview decoder does not support encoding " + encodingName(h.encoding));
     }
@@ -883,6 +1056,8 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
 
         std::vector<std::int32_t> newOffsets;
         newOffsets.reserve(finalEntries.size());
+        std::vector<std::uint32_t> newSizes; // per-entry stored size (.sz), 0xFFFFFFFF for affiliates
+        newSizes.reserve(finalEntries.size());
 
         for (const TextureEntry* ep : finalEntries) {
             const auto& e = *ep;
@@ -890,6 +1065,7 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
             const bool finalAffiliate = !e.replacement && originalAffiliate;
             if (finalAffiliate) {
                 newOffsets.push_back(-1);
+                newSizes.push_back(0xFFFFFFFFu);
                 continue;
             }
 
@@ -900,19 +1076,22 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
 
             if (e.replacement) {
                 const auto& img = *e.replacement;
-                const uint64_t pixelBytes64 = static_cast<uint64_t>(img.width) * img.height * 4;
-                if (pixelBytes64 > std::numeric_limits<uint32_t>::max() - 4)
-                    throw std::runtime_error("Texture is too large: " + e.name);
-                wr16(dat, hash16(e.name));
-                wr16(dat, ENC_RGBA8888);
-                wr16(dat, static_cast<uint16_t>(img.width));
-                wr16(dat, static_cast<uint16_t>(img.height));
-                wr32(dat, static_cast<uint32_t>(pixelBytes64) + 4);
-                wr32(dat, 0); 
-                dat.write(reinterpret_cast<const char*>(img.pixels.data()), static_cast<std::streamsize>(img.pixels.size()));
+                if (img.width > 0xFFFF || img.height > 0x3FFF)
+                    throw std::runtime_error("Texture is too large for the DAT header: " + e.name);
+                const bool dxt5 = img.hasAlpha();
+                const auto payload = encodeDxtLevel(img, dxt5);
+                wr16(dat, hash16(e.name), p.endian);
+                wr16(dat, dxt5 ? ENC_DXT5 : ENC_DXT1, p.endian);
+                wr16(dat, static_cast<uint16_t>(img.width), p.endian);
+                wr16(dat, static_cast<uint16_t>(img.height * 2), p.endian); // 2 * height, mip bit 0 (no mip chain)
+                const uint32_t stored = static_cast<uint32_t>(payload.size()) + 4;
+                wr32(dat, stored, p.endian);
+                wr32(dat, 0, p.endian); // RLE word 0: stored raw
+                dat.write(reinterpret_cast<const char*>(payload.data()), static_cast<std::streamsize>(payload.size()));
                 if (!dat) {
                     throw std::runtime_error("Failed writing texture: " + e.name);
                 }
+                newSizes.push_back(stored);
             } else {
                 if (e.originalIndex < 0)
                     throw std::runtime_error("Internal error: new texture without replacement image");
@@ -920,7 +1099,9 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
                 if (off < 0) {
                     throw std::runtime_error("Internal error: affiliate without replacement");
                 }
-                copyRange(in, dat, static_cast<uint32_t>(off), recordSpan(p, e.originalIndex));
+                const auto span = recordSpan(p, e.originalIndex);
+                copyRange(in, dat, static_cast<uint32_t>(off), span);
+                newSizes.push_back(static_cast<std::uint32_t>(span - 12));
             }
         }
 
@@ -938,11 +1119,28 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
         if (!toc) {
             throw std::runtime_error("Cannot create output TOC: " + outToc.string());
         }
-        wr32(toc, newDatSize);
+        wr32(toc, newDatSize, p.endian);
         for (const auto off : newOffsets) {
-            wr32(toc, static_cast<uint32_t>(off));
+            wr32(toc, static_cast<uint32_t>(off), p.endian);
         }
         toc.close();
+
+        // Only write .sz when the source database had one; databases without it do not need it.
+        const bool wantSz = std::filesystem::exists(std::filesystem::path(p.datPath).replace_extension(".sz"));
+        const auto outSz = out / (m_baseName + "." + p.tag + ".sz");
+        std::filesystem::path tmpSz = outSz;
+        tmpSz += L".tmp";
+        if (wantSz) {
+            std::ofstream sz(tmpSz, std::ios::binary | std::ios::trunc);
+            if (!sz) {
+                throw std::runtime_error("Cannot create output SZ: " + outSz.string());
+            }
+            wr32(sz, newDatSize, p.endian);
+            for (const auto s : newSizes) {
+                wr32(sz, s, p.endian);
+            }
+            sz.close();
+        }
 
         std::error_code ec;
         std::filesystem::remove(outDat, ec);
@@ -956,6 +1154,14 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
         std::filesystem::rename(tmpToc, outToc, ec);
         if (ec) {
             throw std::runtime_error("Cannot finalize TOC: " + ec.message());
+        }
+        if (wantSz) {
+            std::filesystem::remove(outSz, ec);
+            ec.clear();
+            std::filesystem::rename(tmpSz, outSz, ec);
+            if (ec) {
+                throw std::runtime_error("Cannot finalize SZ: " + ec.message());
+            }
         }
     }
 
@@ -982,66 +1188,18 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
     }
     tf.close();
 
-    std::vector<const TextureEntry*> newTextureEntries;
-    for (const TextureEntry* e : finalEntries) {
-        if (e->originalIndex < 0) {
-            if (!e->replacement || !e->replacement->valid()) {
-                throw std::runtime_error("New texture missing valid image while writing TMB");
-            }
-            newTextureEntries.push_back(e);
-        }
-    }
-
-    for (const auto& p : m_platforms) {
-        if (!std::filesystem::exists(p.tmbPath)) {
-            if (!newTextureEntries.empty()) {
-                throw std::runtime_error("Missing thumbnail file for " + p.tag +
-                    ": " + p.tmbPath.string() + ". Cannot safely add textures without TMB.");
-            }
-            continue;
-        }
-        const auto outTmb = out / p.tmbPath.filename();
-        std::filesystem::copy_file(p.tmbPath, outTmb,
-                                   std::filesystem::copy_options::overwrite_existing);
-        if (newTextureEntries.empty()) {
-            continue;
-        }
-        std::ofstream thumb(outTmb, std::ios::binary | std::ios::app);
-        if (!thumb) {
-            throw std::runtime_error("Cannot append thumbnail records: " + outTmb.string());
-        }
-        for (const TextureEntry* e : newTextureEntries) {
-            const auto& img = *e->replacement;
-            const auto pixels = static_cast<std::uint64_t>(img.width) * img.height * 4;
-            if (pixels > std::numeric_limits<std::uint32_t>::max() - 4) {
-                throw std::runtime_error("Thumbnail too large: " + e->name);
-            }
-            wr16(thumb, hash16(e->name));
-            wr16(thumb, ENC_RGBA8888);
-            wr16(thumb, static_cast<std::uint16_t>(img.width));
-            wr16(thumb, static_cast<std::uint16_t>(img.height));
-            wr32(thumb, static_cast<std::uint32_t>(pixels) + 4);
-            wr32(thumb, 0);
-            thumb.write(reinterpret_cast<const char*>(img.pixels.data()),
-                        static_cast<std::streamsize>(img.pixels.size()));
-            if (!thumb) {
-                throw std::runtime_error("Failed appending thumbnail: " + e->name);
-            }
-        }
-    }
-
-    // Preserve other thumbnail formats not represented by a DAT/TOC pair.
     const std::string prefix = lowerAscii(m_baseName) + ".";
     for (const auto& de : std::filesystem::directory_iterator(m_sourceDir)) {
-        if (!de.is_regular_file()) continue;
+        if (!de.is_regular_file()) {
+            continue;
+        }
         const auto fn = de.path().filename().string();
         const auto lfn = lowerAscii(fn);
-        if (!startsWith(lfn, prefix) || !endsWith(lfn, ".tmb")) continue;
-        const auto dst = out / de.path().filename();
-        if (std::filesystem::exists(dst)) continue;
-        std::filesystem::copy_file(de.path(), dst, std::filesystem::copy_options::overwrite_existing);
+        if (startsWith(lfn, prefix) && endsWith(lfn, ".tmb")) {
+            std::error_code ec;
+            std::filesystem::copy_file(de.path(), out / de.path().filename(), std::filesystem::copy_options::overwrite_existing, ec);
+        }
     }
-
 }
 
 std::string TextureDatabase::validationSummary() const {
