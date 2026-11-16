@@ -18,8 +18,10 @@
 #include <cmath>
 #include <cwctype>
 #include <filesystem>
+#include <map>
 #include <memory>
 #include <optional>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -32,7 +34,7 @@ constexpr wchar_t WindowClass[] = L"TexDBEditor.ImGui";
 constexpr size_t InvalidIndex = static_cast<size_t>(-1);
 
 enum class Language { English, Russian };
-enum class TextId { AppTitle, File, Open, SaveAs, Exit, Texture, Replace, Add, Export, Delete, View, Fit, ActualSize, Language, English, Russian, Search, Name, Size, Alpha, State, Preview, Properties, NoDatabase, OpenHint, NoSelection,Dimensions, AlphaMode, MipMode, Affiliate, Yes, No, Platforms, PreviewSource, TxtRow, NewState, ModifiedState, AffiliateState, OriginalState, Zoom, About, AboutText, UnsavedTitle, UnsavedText, ExistingTitle, ExistingText, DeleteTitle, DeleteText, SaveComplete, OpenDialog, ReplaceDialog, AddDialog, ExportDialog, FolderDialog, StatusReplaced, StatusAdded, StatusDeleted, StatusSaved, StatusExported, ErrorTitle, DecodeUnavailable };
+enum class TextId { AppTitle, File, Open, SaveAs, Exit, Texture, Replace, Add, Export, Delete, View, Fit, ActualSize, Language, English, Russian, Search, Name, Size, Alpha, State, Preview, Properties, NoDatabase, OpenHint, NoSelection,Dimensions, AlphaMode, MipMode, Affiliate, Yes, No, Platforms, PreviewSource, TxtRow, NewState, ModifiedState, AffiliateState, OriginalState, Zoom, About, AboutText, UnsavedTitle, UnsavedText, ExistingTitle, ExistingText, DeleteTitle, DeleteText, SaveComplete, OpenDialog, ReplaceDialog, AddDialog, ExportDialog, FolderDialog, StatusReplaced, StatusAdded, StatusDeleted, StatusSaved, StatusExported, ErrorTitle, DecodeUnavailable, SelectAll, SelectedCount, BatchReplaced, BatchExported, BatchDeleted, BatchMissing, BatchFailed, DeleteManyText, ReplaceFolderDialog, ExportFolderDialog, DropAdded, DropIgnored, DropSameName, DropNew, DropConfirmTitle, DropContinue, DropNoImages };
 
 const char* tr(Language lang, TextId id) {
     const bool ru = lang == Language::Russian;
@@ -167,6 +169,40 @@ const char* tr(Language lang, TextId id) {
         return ru ? "Ошибка" : "Error";
     case TextId::DecodeUnavailable:
         return ru ? "превью недоступно" : "preview unavailable";
+    case TextId::SelectAll:
+        return ru ? "Выбрать все" : "Select all";
+    case TextId::SelectedCount:
+        return ru ? "выбрано" : "selected";
+    case TextId::BatchReplaced:
+        return ru ? "Заменено" : "Replaced";
+    case TextId::BatchExported:
+        return ru ? "Экспортировано" : "Exported";
+    case TextId::BatchDeleted:
+        return ru ? "Помечено на удаление" : "Marked for deletion";
+    case TextId::BatchMissing:
+        return ru ? "без подходящего файла" : "without a matching file";
+    case TextId::BatchFailed:
+        return ru ? "с ошибкой" : "failed";
+    case TextId::DeleteManyText:
+        return ru ? "текстур будут удалены из пересобранной базы. Продолжить?" : "textures will be removed from the rebuilt database. Continue?";
+    case TextId::ReplaceFolderDialog:
+        return ru ? "Папка с PNG-файлами, названными как текстуры" : "Folder with PNG files named like the textures";
+    case TextId::ExportFolderDialog:
+        return ru ? "Папка для экспорта PNG-файлов" : "Folder to export PNG files into";
+    case TextId::DropAdded:
+        return ru ? "Добавлено" : "Added";
+    case TextId::DropIgnored:
+        return ru ? "пропущено (не изображения)" : "skipped (not images)";
+    case TextId::DropSameName:
+        return ru ? "с таким же именем (будут заменены)" : "with the same name (will be replaced)";
+    case TextId::DropNew:
+        return ru ? "новых (будут добавлены)" : "new (will be added)";
+    case TextId::DropConfirmTitle:
+        return ru ? "Добавление файлов" : "Add files";
+    case TextId::DropContinue:
+        return ru ? "Продолжить?" : "Continue?";
+    case TextId::DropNoImages:
+        return ru ? "Нет изображений PNG, JPG или BMP для добавления" : "No PNG, JPG or BMP images to add";
     }
     return "";
 }
@@ -176,7 +212,9 @@ struct AppState {
     Language language{Language::English};
     std::unique_ptr<texdb::TextureDatabase> db;
     std::vector<size_t> visible;
-    size_t selected{InvalidIndex};
+    size_t selected{InvalidIndex};      // entry shown in the preview
+    std::set<size_t> marked;            // entries selected for batch actions
+    size_t anchor{InvalidIndex};        // last clicked row, origin for Shift+click
     std::optional<texdb::ImageRGBA> preview;
     std::string previewSource;
     ComPtr<ID3D11ShaderResourceView> previewSrv;
@@ -274,7 +312,7 @@ std::optional<std::filesystem::path> pickSavePng(const std::wstring& suggestedNa
     return std::filesystem::path(pathBuffer);
 }
 
-std::optional<std::filesystem::path> pickFolder() {
+std::optional<std::filesystem::path> pickFolder(TextId titleId = TextId::FolderDialog) {
     IFileDialog* dialog = nullptr;
     const HRESULT createResult = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
 
@@ -286,7 +324,7 @@ std::optional<std::filesystem::path> pickFolder() {
     dialog->GetOptions(&options);
     dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
 
-    const std::wstring title = widen(tr(g.language, TextId::FolderDialog));
+    const std::wstring title = widen(tr(g.language, titleId));
     dialog->SetTitle(title.c_str());
 
     if (FAILED(dialog->Show(g.hwnd))) {
@@ -380,6 +418,10 @@ void rebuildVisible() {
 
         g.visible.push_back(index);
     }
+
+    // Drop marked entries that the current filter hides, so batch actions only touch what is on screen.
+    const std::set<size_t> visibleSet(g.visible.begin(), g.visible.end());
+    std::erase_if(g.marked, [&](size_t index) { return visibleSet.count(index) == 0; });
 }
 
 void selectTexture(size_t index) {
@@ -422,6 +464,8 @@ void openDatabase(const std::filesystem::path& path) {
         g.db = std::move(database);
         g.dirty = false;
         g.selected = InvalidIndex;
+        g.marked.clear();
+        g.anchor = InvalidIndex;
         g.search[0] = 0;
 
         releasePreview();
@@ -445,8 +489,204 @@ void commandOpen() {
     }
 }
 
+// Entries that a batch action applies to: the marked set when it holds more than one
+// entry, otherwise just the entry in the preview.
+std::vector<size_t> actionTargets() {
+    if (g.marked.size() > 1) {
+        return std::vector<size_t>(g.marked.begin(), g.marked.end());
+    }
+    if (g.db && g.selected != InvalidIndex && g.selected < g.db->entries().size()) {
+        return {g.selected};
+    }
+    return {};
+}
+
+void selectOnly(size_t index) {
+    g.marked.clear();
+    g.marked.insert(index);
+    g.anchor = index;
+    selectTexture(index);
+}
+
+void selectAllVisible() {
+    if (!g.db || g.visible.empty()) {
+        return;
+    }
+
+    g.marked.clear();
+    g.marked.insert(g.visible.begin(), g.visible.end());
+    g.anchor = g.visible.front();
+
+    if (g.selected == InvalidIndex || g.marked.count(g.selected) == 0) {
+        selectTexture(g.visible.front());
+    }
+}
+
+// Click on a table row: plain = only this row, Ctrl = toggle, Shift = range from the anchor.
+void handleRowClick(size_t index, bool ctrl, bool shift) {
+    if (shift && g.anchor != InvalidIndex) {
+        const auto a = std::find(g.visible.begin(), g.visible.end(), g.anchor);
+        const auto b = std::find(g.visible.begin(), g.visible.end(), index);
+
+        if (a != g.visible.end() && b != g.visible.end()) {
+            if (!ctrl) {
+                g.marked.clear();
+            }
+            const auto lo = a < b ? a : b;
+            const auto hi = a < b ? b : a;
+            for (auto it = lo; it <= hi; ++it) {
+                g.marked.insert(*it);
+            }
+            selectTexture(index);
+            return;
+        }
+    }
+
+    if (ctrl) {
+        if (g.marked.count(index) != 0) {
+            g.marked.erase(index);
+        }
+        else {
+            g.marked.insert(index);
+        }
+        g.anchor = index;
+        selectTexture(index);
+        return;
+    }
+
+    selectOnly(index);
+}
+
+std::string batchStatus(TextId label, size_t done, size_t missing, size_t failed) {
+    std::string text = std::string(tr(g.language, label)) + ": " + std::to_string(done);
+    if (missing > 0) {
+        text += std::string(" | ") + std::to_string(missing) + " " + tr(g.language, TextId::BatchMissing);
+    }
+    if (failed > 0) {
+        text += std::string(" | ") + std::to_string(failed) + " " + tr(g.language, TextId::BatchFailed);
+    }
+    return text;
+}
+
+std::optional<std::filesystem::path> findReplacementFile(const std::filesystem::path& folder, const std::string& name) {
+    static const wchar_t* const extensions[] = {L".png", L".jpg", L".jpeg", L".bmp"};
+
+    for (const wchar_t* extension : extensions) {
+        const auto candidate = folder / (widen(name) + extension);
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate, ec)) {
+            return candidate;
+        }
+    }
+    return std::nullopt;
+}
+
+void commandReplaceMany() {
+    const auto folder = pickFolder(TextId::ReplaceFolderDialog);
+    if (!folder) {
+        return;
+    }
+
+    size_t replaced = 0;
+    size_t missing = 0;
+    size_t failed = 0;
+    std::string lastError;
+
+    for (size_t index : actionTargets()) {
+        const std::string name = g.db->entries()[index].name;
+        const auto file = findReplacementFile(*folder, name);
+        if (!file) {
+            ++missing;
+            continue;
+        }
+
+        try {
+            g.db->replace(index, imageio::LoadRGBA(*file));
+            ++replaced;
+        }
+        catch (const std::exception& ex) {
+            ++failed;
+            lastError = ex.what();
+        }
+    }
+
+    if (replaced > 0) {
+        g.dirty = true;
+    }
+
+    rebuildVisible();
+    if (g.selected != InvalidIndex && g.selected < g.db->entries().size()) {
+        selectTexture(g.selected);
+    }
+
+    g.status = batchStatus(TextId::BatchReplaced, replaced, missing, failed);
+    if (failed > 0) {
+        errorBox(lastError);
+    }
+}
+
+void commandExportMany() {
+    const auto folder = pickFolder(TextId::ExportFolderDialog);
+    if (!folder) {
+        return;
+    }
+
+    size_t exported = 0;
+    size_t failed = 0;
+    std::string lastError;
+
+    for (size_t index : actionTargets()) {
+        try {
+            const auto image = g.db->decode(index);
+            const std::wstring fileName = widen(g.db->entries()[index].name) + L".png";
+            imageio::SavePNG(*folder / fileName, image);
+            ++exported;
+        }
+        catch (const std::exception& ex) {
+            ++failed;
+            lastError = ex.what();
+        }
+    }
+
+    g.status = batchStatus(TextId::BatchExported, exported, 0, failed);
+    if (failed > 0) {
+        errorBox(lastError);
+    }
+}
+
+void commandDeleteMany() {
+    const auto targets = actionTargets();
+    const std::wstring text = widen(std::to_string(targets.size()) + " " + tr(g.language, TextId::DeleteManyText));
+    const std::wstring title = widen(tr(g.language, TextId::DeleteTitle));
+
+    if (MessageBoxW(g.hwnd, text.c_str(), title.c_str(), MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+
+    for (size_t index : targets) {
+        g.db->erase(index);
+    }
+
+    g.dirty = true;
+    g.marked.clear();
+    g.selected = InvalidIndex;
+    releasePreview();
+    rebuildVisible();
+
+    if (!g.visible.empty()) {
+        selectOnly(g.visible.front());
+    }
+
+    g.status = batchStatus(TextId::BatchDeleted, targets.size(), 0, 0);
+}
+
 void commandReplace() {
     if (!g.db || g.selected == InvalidIndex) {
+        return;
+    }
+
+    if (actionTargets().size() > 1) {
+        commandReplaceMany();
         return;
     }
 
@@ -530,6 +770,11 @@ void commandDelete() {
         return;
     }
 
+    if (actionTargets().size() > 1) {
+        commandDeleteMany();
+        return;
+    }
+
     const std::wstring text = widen(tr(g.language, TextId::DeleteText));
     const std::wstring title = widen(tr(g.language, TextId::DeleteTitle));
 
@@ -555,6 +800,11 @@ void commandDelete() {
 
 void commandExport() {
     if (!g.db || g.selected == InvalidIndex) {
+        return;
+    }
+
+    if (actionTargets().size() > 1) {
+        commandExportMany();
         return;
     }
 
@@ -817,6 +1067,12 @@ void drawMenuBar() {
             commandDelete();
         }
 
+        ImGui::Separator();
+
+        if (ImGui::MenuItem(tr(g.language, TextId::SelectAll), "Ctrl+A", false, g.db != nullptr)) {
+            selectAllVisible();
+        }
+
         ImGui::EndMenu();
     }
 
@@ -867,8 +1123,9 @@ void drawTextureTable(ImVec2 tableSize) {
             ImGui::TableSetColumnIndex(0);
             ImGui::PushID(static_cast<int>(index));
 
-            if (ImGui::Selectable(entry.name.c_str(), g.selected == index, ImGuiSelectableFlags_SpanAllColumns)) {
-                selectTexture(index);
+            if (ImGui::Selectable(entry.name.c_str(), g.marked.count(index) != 0, ImGuiSelectableFlags_SpanAllColumns)) {
+                const ImGuiIO& io = ImGui::GetIO();
+                handleRowClick(index, io.KeyCtrl, io.KeyShift);
             }
 
             ImGui::PopID();
@@ -974,7 +1231,12 @@ void drawUI() {
     ImGui::EndChild();
 
     ImGui::Separator();
-    ImGui::TextDisabled("%s", g.status.c_str());
+    if (g.marked.size() > 1) {
+        ImGui::TextDisabled("%zu %s  |  %s", g.marked.size(), tr(g.language, TextId::SelectedCount), g.status.c_str());
+    }
+    else {
+        ImGui::TextDisabled("%s", g.status.c_str());
+    }
     ImGui::End();
 }
 
@@ -1016,25 +1278,144 @@ bool createDevice(HWND hwnd) {
     return true;
 }
 
+std::wstring lowerWide(std::wstring text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](wchar_t ch) { return static_cast<wchar_t>(towlower(ch)); });
+    return text;
+}
+
+bool isImageExtension(const std::wstring& extension) {
+    return extension == L".png" || extension == L".jpg" || extension == L".jpeg" || extension == L".bmp";
+}
+
+// Several files dropped at once: files whose name matches an existing texture replace it,
+// the others are added. Asks once for the whole batch, showing both counts.
+void commandDropBatch(const std::vector<std::filesystem::path>& paths) {
+    if (!g.db) {
+        return;
+    }
+
+    // One file per texture name; if the same name arrives twice, the last one wins.
+    std::map<std::string, std::filesystem::path> files;
+    size_t ignored = 0;
+
+    for (const auto& path : paths) {
+        if (!isImageExtension(lowerWide(path.extension().wstring()))) {
+            ++ignored;
+            continue;
+        }
+        files[narrowUtf8(path.stem().wstring())] = path;
+    }
+
+    if (files.empty()) {
+        g.status = tr(g.language, TextId::DropNoImages);
+        return;
+    }
+
+    size_t sameName = 0;
+    size_t newCount = 0;
+    for (const auto& [name, path] : files) {
+        if (g.db->findByName(name) >= 0) {
+            ++sameName;
+        }
+        else {
+            ++newCount;
+        }
+    }
+
+    const std::string summary =
+        std::to_string(sameName) + " " + tr(g.language, TextId::DropSameName) + "\n" +
+        std::to_string(newCount) + " " + tr(g.language, TextId::DropNew) + "\n" +
+        (ignored > 0 ? std::to_string(ignored) + " " + tr(g.language, TextId::DropIgnored) + "\n" : std::string()) +
+        tr(g.language, TextId::DropContinue);
+
+    const std::wstring text = widen(summary);
+    const std::wstring title = widen(tr(g.language, TextId::DropConfirmTitle));
+    if (MessageBoxW(g.hwnd, text.c_str(), title.c_str(), MB_YESNO | MB_ICONQUESTION) != IDYES) {
+        return;
+    }
+
+    size_t replaced = 0;
+    size_t added = 0;
+    size_t failed = 0;
+    size_t lastIndex = InvalidIndex;
+    std::string lastError;
+
+    for (const auto& [name, path] : files) {
+        try {
+            auto image = imageio::LoadRGBA(path);
+            const int existing = g.db->findByName(name);
+
+            if (existing >= 0) {
+                g.db->replace(static_cast<size_t>(existing), std::move(image));
+                lastIndex = static_cast<size_t>(existing);
+                ++replaced;
+            }
+            else {
+                lastIndex = g.db->add(name, std::move(image));
+                ++added;
+            }
+        }
+        catch (const std::exception& ex) {
+            ++failed;
+            lastError = ex.what();
+        }
+    }
+
+    if (replaced + added > 0) {
+        g.dirty = true;
+    }
+
+    rebuildVisible();
+    if (lastIndex != InvalidIndex) {
+        selectOnly(lastIndex);
+    }
+
+    std::string status = std::string(tr(g.language, TextId::BatchReplaced)) + ": " + std::to_string(replaced) +
+                         " | " + tr(g.language, TextId::DropAdded) + ": " + std::to_string(added);
+    if (ignored > 0) {
+        status += " | " + std::to_string(ignored) + " " + tr(g.language, TextId::DropIgnored);
+    }
+    if (failed > 0) {
+        status += " | " + std::to_string(failed) + " " + tr(g.language, TextId::BatchFailed);
+    }
+    g.status = status;
+
+    if (failed > 0) {
+        errorBox(lastError);
+    }
+}
+
 void handleDropFiles(WPARAM wParam) {
     HDROP drop = reinterpret_cast<HDROP>(wParam);
-    wchar_t pathBuffer[32768]{};
+    const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
 
-    if (DragQueryFileW(drop, 0, pathBuffer, static_cast<UINT>(std::size(pathBuffer)))) {
-        std::filesystem::path path(pathBuffer);
-        std::wstring extension = path.extension().wstring();
+    std::vector<std::filesystem::path> paths;
+    for (UINT index = 0; index < count; ++index) {
+        wchar_t pathBuffer[32768]{};
+        if (DragQueryFileW(drop, index, pathBuffer, static_cast<UINT>(std::size(pathBuffer)))) {
+            paths.emplace_back(pathBuffer);
+        }
+    }
+    DragFinish(drop);
 
-        std::transform(extension.begin(), extension.end(), extension.begin(), [](wchar_t ch) {return static_cast<wchar_t>(towlower(ch));});
+    if (paths.empty()) {
+        return;
+    }
 
-        if (extension == L".txt") {
+    if (paths.size() == 1) {
+        const auto& path = paths.front();
+        if (lowerWide(path.extension().wstring()) == L".txt") {
             openDatabase(path);
         }
         else if (g.db) {
             commandAdd(&path);
         }
+        return;
     }
 
-    DragFinish(drop);
+    if (g.db) {
+        commandDropBatch(paths);
+    }
 }
 
 bool handleShortcut(WPARAM key) {
@@ -1059,6 +1440,10 @@ bool handleShortcut(WPARAM key) {
     }
     if (ctrlPressed && shiftPressed && key == 'S') {
         commandSaveAs();
+        return true;
+    }
+    if (ctrlPressed && key == 'A' && !ImGui::GetIO().WantTextInput) {
+        selectAllVisible();
         return true;
     }
     if (key == VK_DELETE && !ImGui::GetIO().WantTextInput) {
