@@ -1125,18 +1125,22 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
         }
         toc.close();
 
+        // Only write .sz when the source database had one; databases without it do not need it.
+        const bool wantSz = std::filesystem::exists(std::filesystem::path(p.datPath).replace_extension(".sz"));
         const auto outSz = out / (m_baseName + "." + p.tag + ".sz");
         std::filesystem::path tmpSz = outSz;
         tmpSz += L".tmp";
-        std::ofstream sz(tmpSz, std::ios::binary | std::ios::trunc);
-        if (!sz) {
-            throw std::runtime_error("Cannot create output SZ: " + outSz.string());
+        if (wantSz) {
+            std::ofstream sz(tmpSz, std::ios::binary | std::ios::trunc);
+            if (!sz) {
+                throw std::runtime_error("Cannot create output SZ: " + outSz.string());
+            }
+            wr32(sz, newDatSize, p.endian);
+            for (const auto s : newSizes) {
+                wr32(sz, s, p.endian);
+            }
+            sz.close();
         }
-        wr32(sz, newDatSize, p.endian);
-        for (const auto s : newSizes) {
-            wr32(sz, s, p.endian);
-        }
-        sz.close();
 
         std::error_code ec;
         std::filesystem::remove(outDat, ec);
@@ -1151,11 +1155,13 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
         if (ec) {
             throw std::runtime_error("Cannot finalize TOC: " + ec.message());
         }
-        std::filesystem::remove(outSz, ec);
-        ec.clear();
-        std::filesystem::rename(tmpSz, outSz, ec);
-        if (ec) {
-            throw std::runtime_error("Cannot finalize SZ: " + ec.message());
+        if (wantSz) {
+            std::filesystem::remove(outSz, ec);
+            ec.clear();
+            std::filesystem::rename(tmpSz, outSz, ec);
+            if (ec) {
+                throw std::runtime_error("Cannot finalize SZ: " + ec.message());
+            }
         }
     }
 
