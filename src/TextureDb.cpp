@@ -222,6 +222,10 @@ Endian endianForTag(const std::string& tag) {
     return lowerAscii(tag) == "ps3" ? Endian::Big : Endian::Little;
 }
 
+bool isPs3(const PlatformInfo& p) {
+    return lowerAscii(p.tag) == "ps3";
+}
+
 // Rebuilds the offset table by walking the DAT. Records are stored back to back in TXT
 // order; affiliate entries have no record. Every record's hash must match its TXT name.
 std::vector<std::int32_t> scanDatOffsets(const std::filesystem::path& datPath, uint32_t datSize,
@@ -281,9 +285,19 @@ std::size_t encodedMipSize(uint16_t encoding, uint32_t w, uint32_t h) {
     }
 }
 
-std::size_t totalEncodedSize(uint16_t encoding, uint32_t w, uint32_t h, bool hasMipChain) {
+std::size_t totalEncodedSize(uint16_t encoding, uint32_t w, uint32_t h, bool hasMipChain, bool ps3) {
     std::size_t total = encodedMipSize(encoding, w, h);
     if (!hasMipChain || total == 0) {
+        return total;
+    }
+
+    // Non-PS3 DXT chains stop at 4x4, as the original reader did. PS3 chains go down to 1x1.
+    if (!ps3 && (encoding == ENC_DXT1 || encoding == ENC_DXT5)) {
+        while (w > 4 && h > 4) {
+            w = std::max<uint32_t>(1, w / 2);
+            h = std::max<uint32_t>(1, h / 2);
+            total += encodedMipSize(encoding, w, h);
+        }
         return total;
     }
 
@@ -917,14 +931,16 @@ ImageRGBA TextureDatabase::decodeRecord(const PlatformInfo& p, int originalIndex
     const RecordHeader h = readHeader(p, originalIndex);
     const std::int32_t off = p.offsets.at(static_cast<std::size_t>(originalIndex));
     const uint32_t w = h.width;
-    // Height field stores 2 * height; the low bit set means a mip chain follows.
-    const uint32_t hh = (h.heightMask & 0x7FFF) >> 1;
+    // PS3 stores 2 * height with the mip flag in the low bit; other platforms store the
+    // height directly with the mip flag in bit 15 (the original layout).
+    const bool ps3 = isPs3(p);
+    const uint32_t hh = ps3 ? ((h.heightMask & 0x7FFF) >> 1) : (h.heightMask & 0x7FFF);
     if (!w || !hh) {
         throw std::runtime_error("Texture has zero dimensions");
     }
 
-    const bool hasMipChain = (h.heightMask & 0x0001) != 0;
-    const std::size_t expected = totalEncodedSize(h.encoding, w, hh, hasMipChain);
+    const bool hasMipChain = ps3 ? (h.heightMask & 0x0001) != 0 : (h.heightMask & 0x8000) != 0;
+    const std::size_t expected = totalEncodedSize(h.encoding, w, hh, hasMipChain, ps3);
     if (expected == 0) {
         throw std::runtime_error("Preview decoder does not support encoding " + encodingName(h.encoding));
     }
@@ -1078,12 +1094,21 @@ void TextureDatabase::saveAs(const std::filesystem::path& outputDir) const {
                 const auto& img = *e.replacement;
                 if (img.width > 0xFFFF || img.height > 0x3FFF)
                     throw std::runtime_error("Texture is too large for the DAT header: " + e.name);
-                const bool dxt5 = img.hasAlpha();
-                const auto payload = encodeDxtLevel(img, dxt5);
+                // PS3: DXT with 2 * height in the header. Other platforms: raw RGBA8888 with the
+                // plain height, as the original editor wrote them.
+                uint16_t encoding = ENC_RGBA8888;
+                uint16_t heightField = static_cast<uint16_t>(img.height);
+                std::vector<uint8_t> payload = img.pixels;
+                if (isPs3(p)) {
+                    const bool dxt5 = img.hasAlpha();
+                    encoding = dxt5 ? ENC_DXT5 : ENC_DXT1;
+                    heightField = static_cast<uint16_t>(img.height * 2); // mip bit 0: no mip chain
+                    payload = encodeDxtLevel(img, dxt5);
+                }
                 wr16(dat, hash16(e.name), p.endian);
-                wr16(dat, dxt5 ? ENC_DXT5 : ENC_DXT1, p.endian);
+                wr16(dat, encoding, p.endian);
                 wr16(dat, static_cast<uint16_t>(img.width), p.endian);
-                wr16(dat, static_cast<uint16_t>(img.height * 2), p.endian); // 2 * height, mip bit 0 (no mip chain)
+                wr16(dat, heightField, p.endian);
                 const uint32_t stored = static_cast<uint32_t>(payload.size()) + 4;
                 wr32(dat, stored, p.endian);
                 wr32(dat, 0, p.endian); // RLE word 0: stored raw
