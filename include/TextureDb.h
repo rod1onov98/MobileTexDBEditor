@@ -28,8 +28,12 @@ struct TextureEntry {
     std::optional<ImageRGBA> replacement;
 };
 
+// Byte order used by a platform's TOC, DAT record headers and texel data.
+enum class Endian { Little, Big };
+
 struct PlatformInfo {
-    std::string tag; // dxt / etc / pvr / ...
+    std::string tag; // dxt / etc / pvr / ps3 / ...
+    Endian endian{Endian::Little};
     std::filesystem::path datPath;
     std::filesystem::path tocPath;
     std::filesystem::path tmbPath;
